@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Travel London — Population Density</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #map { height: 100%; }
+  .panel {
+    background: #fff; padding: 10px 14px; border-radius: 8px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.25); max-width: 260px;
+  }
+  .panel h1 { font-size: 16px; margin: 0 0 2px; }
+  .panel .sub { font-size: 12px; color: #666; margin: 0 0 6px; }
+  .panel .hover-name { font-size: 14px; font-weight: 600; margin: 4px 0 2px; }
+  .panel .hover-stats { font-size: 12px; color: #333; line-height: 1.5; }
+  .panel .hint { font-size: 11px; color: #999; }
+  .legend { line-height: 1.4; font-size: 11px; }
+  .legend i { width: 14px; height: 14px; float: left; margin-right: 6px; opacity: .85; }
+  .legend .title { font-weight: 600; margin-bottom: 4px; }
+  #status { font-size: 11px; color: #2a7a2a; margin-top: 6px; }
+  #status.err { color: #b00020; }
+  .credits { font-size: 10px; color: #888; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+// ---------------------------------------------------------------
+// Travel London — Layer 1: Population density by borough
+// Population: ONS mid-2024 estimates. Area: ONS land area (km²).
+// Boundaries: GLA borough boundaries (GeoJSON, loaded at runtime).
+// ---------------------------------------------------------------
+
+// [population mid-2024, land area km²]
+const BOROUGHS = {
+  "Barking and Dagenham": [232747, 36.1],
+  "Barnet":               [405050, 86.7],
+  "Bexley":               [256434, 60.6],
+  "Brent":                [352976, 43.2],
+  "Bromley":              [335319, 150.1],
+  "Camden":               [216943, 21.8],
+  "City of London":       [15111,  2.9],
+  "Westminster":          [209996, 21.5],
+  "Croydon":              [409342, 86.5],
+  "Ealing":               [385985, 55.5],
+  "Enfield":              [327434, 80.8],
+  "Greenwich":            [299528, 47.3],
+  "Hackney":              [266758, 19.1],
+  "Hammersmith and Fulham":[188687, 16.4],
+  "Haringey":             [263850, 29.6],
+  "Harrow":               [270724, 50.5],
+  "Havering":             [276274, 112.3],
+  "Hillingdon":           [329185, 115.7],
+  "Hounslow":             [299424, 56.0],
+  "Islington":            [223024, 14.9],
+  "Kensington and Chelsea":[144518, 12.1],
+  "Kingston upon Thames": [172692, 37.3],
+  "Lambeth":              [316920, 26.8],
+  "Lewisham":             [301255, 35.1],
+  "Merton":               [218539, 37.6],
+  "Newham":               [374523, 36.2],
+  "Redbridge":            [321231, 56.4],
+  "Richmond upon Thames": [196678, 57.4],
+  "Southwark":            [314786, 28.9],
+  "Sutton":               [214525, 43.8],
+  "Tower Hamlets":        [331886, 19.8],
+  "Waltham Forest":       [279737, 38.8],
+  "Wandsworth":           [337655, 34.3]
+};
+
+// Tolerant name matching between boundary file and data table
+const LOOKUP = {};
+for (const k of Object.keys(BOROUGHS)) LOOKUP[k.toLowerCase()] = k;
+function matchBorough(rawName) {
+  if (!rawName) return null;
+  const n = rawName.toLowerCase().trim();
+  if (LOOKUP[n]) return LOOKUP[n];                                   // exact
+  if (n === "city of london") return "City of London";               // protect special case
+  const stripped = n.replace(/^city of /, "").replace(/^london borough of /, "").replace(/^royal borough of /, "");
+  if (LOOKUP[stripped]) return LOOKUP[stripped];                     // e.g. "City of Westminster"
+  return null;
+}
+
+function density(name) {
+  const d = BOROUGHS[name];
+  return d ? d[0] / d[1] : null;
+}
+
+// Colour scale (people per km²)
+const BREAKS = [3000, 5000, 7000, 9000, 11000, 13000, 15000];
+const COLOURS = ["#ffffcc","#ffeda0","#fed976","#feb24c","#fd8d3c","#fc4e2a","#e31a1c","#b10026"];
+function colourFor(v) {
+  let i = 0;
+  while (i < BREAKS.length && v >= BREAKS[i]) i++;
+  return COLOURS[i];
+}
+
+const map = L.map("map").setView([51.49, -0.12], 10);
+L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  maxZoom: 18
+}).addTo(map);
+
+// Info panel (top right)
+const info = L.control({ position: "topright" });
+info.onAdd = function () {
+  this._div = L.DomUtil.create("div", "panel");
+  this.update();
+  return this._div;
+};
+info.update = function (name) {
+  let body;
+  if (name && BOROUGHS[name]) {
+    const [pop, area] = BOROUGHS[name];
+    const dens = Math.round(pop / area).toLocaleString("en-GB");
+    body = '<div class="hover-name">' + name + '</div>' +
+           '<div class="hover-stats">Population: ' + pop.toLocaleString("en-GB") +
+           '<br>Area: ' + area + ' km²' +
+           '<br>Density: ' + dens + ' people/km²</div>';
+  } else {
+    body = '<div class="hint">Hover over a borough</div>';
+  }
+  this._div.innerHTML =
+    '<h1>Travel London</h1>' +
+    '<p class="sub">Layer 1 — Population density</p>' + body +
+    '<div id="status"></div>' +
+    '<div class="credits">Population: ONS mid-2024 estimates.<br>Boundaries: GLA. Basemap: CARTO/OSM.</div>';
+};
+info.addTo(map);
+
+// Legend (bottom right)
+const legend = L.control({ position: "bottomright" });
+legend.onAdd = function () {
+  const div = L.DomUtil.create("div", "panel legend");
+  let html = '<div class="title">People per km²</div>';
+  const edges = [0].concat(BREAKS);
+  for (let i = 0; i < edges.length; i++) {
+    const from = edges[i].toLocaleString("en-GB");
+    const to = BREAKS[i] ? BREAKS[i].toLocaleString("en-GB") : "+";
+    html += '<i style="background:' + COLOURS[i] + '"></i>' + from + (BREAKS[i] ? " – " + to : "+") + "<br>";
+  }
+  div.innerHTML = html;
+  return div;
+};
+legend.addTo(map);
+
+function setStatus(msg, isError) {
+  const el = document.getElementById("status");
+  if (el) { el.textContent = msg; el.className = isError ? "err" : ""; }
+}
+
+// Load boundaries and draw the choropleth
+const BOUNDARIES_URL = "https://raw.githubusercontent.com/radoi90/housequest-data/master/london_boroughs.geojson";
+let geoLayer;
+
+fetch(BOUNDARIES_URL)
+  .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(geo => {
+    let matched = 0;
+    const unmatched = [];
+    geoLayer = L.geoJSON(geo, {
+      style: f => {
+        const name = matchBorough(f.properties.name);
+        const v = name ? density(name) : null;
+        return {
+          fillColor: v ? colourFor(v) : "#cccccc",
+          fillOpacity: 0.65,
+          color: "#ffffff",
+          weight: 1.5
+        };
+      },
+      onEachFeature: (f, layer) => {
+        const name = matchBorough(f.properties.name);
+        if (name) matched++; else unmatched.push(f.properties.name);
+        layer.on({
+          mouseover: e => {
+            e.target.setStyle({ weight: 3, color: "#444", fillOpacity: 0.8 });
+            info.update(name);
+          },
+          mouseout: e => {
+            geoLayer.resetStyle(e.target);
+            info.update();
+          },
+          click: e => map.fitBounds(e.target.getBounds())
+        });
+      }
+    }).addTo(map);
+    map.fitBounds(geoLayer.getBounds());
+    if (unmatched.length) {
+      setStatus("Warning: no data for " + unmatched.join(", "), true);
+    } else {
+      setStatus(matched + "/33 boroughs loaded ✓", false);
+    }
+  })
+  .catch(err => setStatus("Could not load boundaries: " + err.message, true));
+</script>
+</body>
+</html>

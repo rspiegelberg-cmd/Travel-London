@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Travel London — Population Density 3D</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<style>
+  html, body { margin: 0; height: 100%; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  #map { height: 100%; }
+  .panel {
+    position: absolute; top: 10px; right: 10px; z-index: 5;
+    background: #fff; padding: 10px 14px; border-radius: 8px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.25); max-width: 280px;
+  }
+  .panel h1 { font-size: 16px; margin: 0 0 2px; }
+  .panel .sub { font-size: 12px; color: #666; margin: 0 0 6px; }
+  .panel .hover-name { font-size: 14px; font-weight: 600; margin: 4px 0 2px; }
+  .panel .hover-stats { font-size: 12px; color: #333; line-height: 1.5; }
+  .panel .hint { font-size: 11px; color: #999; }
+  #status { font-size: 11px; color: #2a7a2a; margin-top: 6px; }
+  #status.err { color: #b00020; }
+  #status.loading { color: #b07000; }
+  .credits { font-size: 10px; color: #888; margin-top: 6px; }
+  .credits a { color: #667; }
+  .controls-hint { font-size: 10px; color: #999; margin-top: 4px; }
+  .mode { margin: 6px 0 2px; display: flex; gap: 4px; flex-wrap: wrap; }
+  .mode button {
+    font-size: 11px; padding: 4px 8px; border: 1px solid #ccc; background: #f5f5f5;
+    border-radius: 5px; cursor: pointer;
+  }
+  .mode button.active { background: #225ea8; color: #fff; border-color: #225ea8; }
+  .mode-note { font-size: 10px; color: #999; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="panel">
+  <h1>Travel London</h1>
+  <p class="sub">Population density in 3D</p>
+  <div class="mode">
+    <button id="btn-density" class="active">Density blocks</button>
+    <button id="btn-buildings">True buildings</button>
+    <button id="btn-scaled">Scaled buildings</button>
+  </div>
+  <div class="mode-note" id="mode-note">Each area extruded by its density.</div>
+  <div id="hover"><div class="hint">Hover over a block</div></div>
+  <div id="status"></div>
+  <div class="controls-hint">Drag to pan · Right-click drag (or two fingers) to rotate &amp; tilt · Scroll to zoom</div>
+  <div class="credits">Density: Census 2021 (ONS TS006). Boundaries: ONS Open Geography. Buildings: OpenStreetMap.<br>
+  <a href="index.html">2D view</a> · <a href="boroughs.html">Borough view</a></div>
+</div>
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="data/lsoa-density.js"></script>
+<script>
+// ----------------------------------------------------------------------
+// Travel London — Population density in 3D. Three modes:
+//  1. Density blocks  — each LSOA extruded by its density (city-wide read)
+//  2. True buildings  — real OSM buildings at recorded heights
+//  3. Scaled buildings — real buildings, heights multiplied by local
+//     density relative to the London median, so identical buildings look
+//     bigger in crowded areas and smaller in empty ones.
+// ----------------------------------------------------------------------
+
+const BOROUGH_NAMES = ["Barking and Dagenham","Barnet","Bexley","Brent","Bromley","Camden","City of London","Croydon","Ealing","Enfield","Greenwich","Hackney","Hammersmith and Fulham","Haringey","Harrow","Havering","Hillingdon","Hounslow","Islington","Kensington and Chelsea","Kingston upon Thames","Lambeth","Lewisham","Merton","Newham","Redbridge","Richmond upon Thames","Southwark","Sutton","Tower Hamlets","Waltham Forest","Wandsworth","Westminster"];
+const LSOA_SERVICE = "https://services1.arcgis.com/ESMARspQHYMw9BZ9/arcgis/rest/services/Lower_layer_Super_Output_Areas_December_2021_Boundaries_EW_BSC_V4/FeatureServer/0/query";
+const EXPECTED = Object.keys(LSOA_DENSITY).length;
+const MEDIAN_DENSITY = 9000;          // London LSOA median (people/km²)
+const HEIGHT_FACTOR = 0.03;           // blocks: metres per person/km²
+const SCALE_MIN = 0.25, SCALE_MAX = 6; // scaled mode: clamp multiplier
+
+const BREAKS  = [2000, 4000, 6000, 8000, 12000, 16000, 24000, 40000];
+const COLOURS = ["#ffffd9","#edf8b1","#c7e9b4","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#253494","#081d58"];
+function colourFor(v) {
+  let i = 0;
+  while (i < BREAKS.length && v >= BREAKS[i]) i++;
+  return COLOURS[i];
+}
+
+function setStatus(msg, cls) {
+  const el = document.getElementById("status");
+  if (el) { el.textContent = msg; el.className = cls || ""; }
+}
+
+const map = new maplibregl.Map({
+  container: "map",
+  style: "https://tiles.openfreemap.org/styles/positron",
+  center: [-0.12, 51.49],
+  zoom: 9.8,
+  pitch: 55,
+  bearing: -10,
+  antialias: true
+});
+map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }));
+
+function fetchPage(offset) {
+  const body = new URLSearchParams({
+    where: BOROUGH_NAMES.map(b => "LSOA21NM LIKE '" + b + " %'").join(" OR "),
+    outFields: "LSOA21CD",
+    geometryPrecision: "5",
+    resultOffset: String(offset),
+    f: "geojson"
+  });
+  return fetch(LSOA_SERVICE, { method: "POST", body: body })
+    .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); });
+}
+
+async function loadAll() {
+  let features = [];
+  let offset = 0;
+  for (let page = 0; page < 20; page++) {
+    setStatus("Loading boundaries… " + features.length + "/" + EXPECTED, "loading");
+    const fc = await fetchPage(offset);
+    if (fc.error) throw new Error(fc.error.message || "server error");
+    if (!fc.features || !fc.features.length) break;
+    features = features.concat(fc.features);
+    offset = features.length;
+    if (features.length >= EXPECTED) break;
+  }
+  return features;
+}
+
+// ---------- Spatial lookup: which LSOA contains a point? ----------
+const GRID = 0.01; // ~700m cells
+const gridIndex = new Map();
+let lsoaFeatures = [];
+
+function ringBBox(coords, bb) {
+  for (const [x, y] of coords) {
+    if (x < bb[0]) bb[0] = x; if (y < bb[1]) bb[1] = y;
+    if (x > bb[2]) bb[2] = x; if (y > bb[3]) bb[3] = y;
+  }
+}
+function indexLSOAs(features) {
+  lsoaFeatures = features;
+  features.forEach((f, idx) => {
+    const bb = [Infinity, Infinity, -Infinity, -Infinity];
+    const g = f.geometry;
+    const polys = g.type === "Polygon" ? [g.coordinates] : g.coordinates;
+    for (const poly of polys) ringBBox(poly[0], bb);
+    f._bbox = bb;
+    for (let gx = Math.floor(bb[0]/GRID); gx <= Math.floor(bb[2]/GRID); gx++) {
+      for (let gy = Math.floor(bb[1]/GRID); gy <= Math.floor(bb[3]/GRID); gy++) {
+        const key = gx + "_" + gy;
+        if (!gridIndex.has(key)) gridIndex.set(key, []);
+        gridIndex.get(key).push(idx);
+      }
+    }
+  });
+}
+function pointInRing(x, y, ring) {
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function pointInFeature(x, y, f) {
+  const g = f.geometry;
+  const polys = g.type === "Polygon" ? [g.coordinates] : g.coordinates;
+  for (const poly of polys) {
+    if (pointInRing(x, y, poly[0])) {
+      let inHole = false;
+      for (let h = 1; h < poly.length; h++) if (pointInRing(x, y, poly[h])) { inHole = true; break; }
+      if (!inHole) return true;
+    }
+  }
+  return false;
+}
+function lsoaAt(x, y) {
+  const cell = gridIndex.get(Math.floor(x/GRID) + "_" + Math.floor(y/GRID));
+  if (!cell) return null;
+  for (const idx of cell) {
+    const f = lsoaFeatures[idx], bb = f._bbox;
+    if (x >= bb[0] && x <= bb[2] && y >= bb[1] && y <= bb[3] && pointInFeature(x, y, f)) return f;
+  }
+  return null;
+}
+
+// ---------- Scaled buildings: rebuild on map move ----------
+let scaledActive = false;
+let rebuildTimer = null;
+
+function centroidOf(geom) {
+  const ring = geom.type === "Polygon" ? geom.coordinates[0] : geom.coordinates[0][0];
+  let sx = 0, sy = 0;
+  for (const [x, y] of ring) { sx += x; sy += y; }
+  return [sx / ring.length, sy / ring.length];
+}
+
+function rebuildScaled() {
+  if (!scaledActive) return;
+  if (map.getZoom() < 13.5) {
+    setStatus("Zoom in to see scaled buildings", "loading");
+    map.getSource("scaled-buildings").setData({ type: "FeatureCollection", features: [] });
+    return;
+  }
+  const raw = map.queryRenderedFeatures({ layers: ["building"] });
+  const out = [];
+  for (const f of raw) {
+    if (out.length >= 12000) break;
+    const [cx, cy] = centroidOf(f.geometry);
+    const lsoa = lsoaAt(cx, cy);
+    if (!lsoa) continue;
+    const rec = LSOA_DENSITY[lsoa.properties.LSOA21CD];
+    if (!rec) continue;
+    const scale = Math.min(SCALE_MAX, Math.max(SCALE_MIN, rec[1] / MEDIAN_DENSITY));
+    const baseH = Number(f.properties.render_height) || 8;
+    out.push({
+      type: "Feature",
+      geometry: f.geometry,
+      properties: {
+        h: Math.round(baseH * scale),
+        colour: colourFor(rec[1]),
+        name: rec[0],
+        density: rec[1],
+        scale: Math.round(scale * 100) / 100
+      }
+    });
+  }
+  map.getSource("scaled-buildings").setData({ type: "FeatureCollection", features: out });
+  setStatus(out.length.toLocaleString("en-GB") + " buildings scaled by local density");
+}
+function scheduleRebuild() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(rebuildScaled, 250);
+}
+
+map.on("load", () => {
+  loadAll()
+    .then(features => {
+      let matched = 0;
+      for (const f of features) {
+        const rec = LSOA_DENSITY[f.properties.LSOA21CD];
+        if (rec) {
+          matched++;
+          f.properties.name = rec[0];
+          f.properties.density = rec[1];
+          f.properties.colour = colourFor(rec[1]);
+          f.properties.height = Math.round(rec[1] * HEIGHT_FACTOR);
+        } else {
+          f.properties.density = 0;
+          f.properties.colour = "#cccccc";
+          f.properties.height = 0;
+        }
+      }
+      indexLSOAs(features);
+
+      map.addSource("lsoa", { type: "geojson", data: { type: "FeatureCollection", features: features } });
+      map.addSource("scaled-buildings", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+
+      // Flat density wash (underlay for both building modes)
+      map.addLayer({
+        id: "density-flat",
+        type: "fill",
+        source: "lsoa",
+        layout: { visibility: "none" },
+        paint: { "fill-color": ["get", "colour"], "fill-opacity": 0.3 }
+      });
+      // Mode 1: density blocks
+      map.addLayer({
+        id: "density-blocks",
+        type: "fill-extrusion",
+        source: "lsoa",
+        paint: {
+          "fill-extrusion-color": ["get", "colour"],
+          "fill-extrusion-height": ["get", "height"],
+          "fill-extrusion-opacity": 0.85
+        }
+      });
+      // Mode 2: true buildings
+      map.addLayer({
+        id: "buildings-3d",
+        type: "fill-extrusion",
+        source: "openmaptiles",
+        "source-layer": "building",
+        minzoom: 13,
+        layout: { visibility: "none" },
+        paint: {
+          "fill-extrusion-color": "#cdc4ba",
+          "fill-extrusion-height": ["coalesce", ["get", "render_height"], 8],
+          "fill-extrusion-base": ["coalesce", ["get", "render_min_height"], 0],
+          "fill-extrusion-opacity": 0.9
+        }
+      });
+      // Mode 3: density-scaled buildings
+      map.addLayer({
+        id: "buildings-scaled",
+        type: "fill-extrusion",
+        source: "scaled-buildings",
+        layout: { visibility: "none" },
+        paint: {
+          "fill-extrusion-color": ["get", "colour"],
+          "fill-extrusion-height": ["get", "h"],
+          "fill-extrusion-opacity": 0.9
+        }
+      });
+
+      // Hover handlers
+      const hover = document.getElementById("hover");
+      map.on("mousemove", "density-blocks", e => {
+        const p = e.features[0].properties;
+        map.getCanvas().style.cursor = "pointer";
+        hover.innerHTML = '<div class="hover-name">' + p.name + '</div>' +
+          '<div class="hover-stats">Code: ' + p.LSOA21CD +
+          '<br>Density: ' + Number(p.density).toLocaleString("en-GB") + ' people/km²' +
+          '<br>Block height: ' + p.height + ' m</div>';
+      });
+      map.on("mouseleave", "density-blocks", () => {
+        map.getCanvas().style.cursor = "";
+        hover.innerHTML = '<div class="hint">Hover over a block</div>';
+      });
+      map.on("mousemove", "buildings-scaled", e => {
+        const p = e.features[0].properties;
+        hover.innerHTML = '<div class="hover-name">' + p.name + '</div>' +
+          '<div class="hover-stats">Density: ' + Number(p.density).toLocaleString("en-GB") + ' people/km²' +
+          '<br>Height multiplier: ×' + p.scale + '</div>';
+      });
+      map.on("mouseleave", "buildings-scaled", () => {
+        hover.innerHTML = '<div class="hint">Hover over a building</div>';
+      });
+
+      // Mode switching
+      const btns = {
+        density:  document.getElementById("btn-density"),
+        buildings: document.getElementById("btn-buildings"),
+        scaled:   document.getElementById("btn-scaled")
+      };
+      const note = document.getElementById("mode-note");
+      const NOTES = {
+        density:  "Each area extruded by its density.",
+        buildings: "Real buildings at recorded heights (zoom in).",
+        scaled:   "Real buildings, inflated by local density vs the London median (zoom in)."
+      };
+      function setMode(mode) {
+        scaledActive = (mode === "scaled");
+        map.setLayoutProperty("density-blocks", "visibility", mode === "density" ? "visible" : "none");
+        map.setLayoutProperty("buildings-3d",   "visibility", mode === "buildings" ? "visible" : "none");
+        map.setLayoutProperty("buildings-scaled","visibility", mode === "scaled" ? "visible" : "none");
+        map.setLayoutProperty("density-flat",   "visibility", mode === "density" ? "none" : "visible");
+        for (const k in btns) btns[k].className = (k === mode) ? "active" : "";
+        note.textContent = NOTES[mode];
+        if (mode !== "density" && map.getZoom() < 13.5) map.flyTo({ zoom: 14.5, pitch: 60 });
+        if (scaledActive) scheduleRebuild();
+      }
+      btns.density.onclick  = () => setMode("density");
+      btns.buildings.onclick = () => setMode("buildings");
+      btns.scaled.onclick   = () => setMode("scaled");
+
+      map.on("moveend", scheduleRebuild);
+      map.on("idle", () => { if (scaledActive && !map.getSource("scaled-buildings")._data.features.length) scheduleRebuild(); });
+
+      if (matched === EXPECTED) {
+        setStatus(matched.toLocaleString("en-GB") + "/" + EXPECTED.toLocaleString("en-GB") + " areas loaded ✓");
+      } else {
+        setStatus(matched + "/" + EXPECTED + " areas matched", "err");
+      }
+    })
+    .catch(err => setStatus("Could not load boundaries: " + err.message, "err"));
+});
+</script>
+</body>
+</html>
