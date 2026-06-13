@@ -25,6 +25,11 @@
   #status.loading { color: #b07000; }
   .credits { font-size: 10px; color: #888; margin-top: 6px; }
   .credits a { color: #667; }
+  .rw-popup { font-size: 12px; line-height: 1.45; max-width: 260px; }
+  .rw-popup .rw-loc { font-weight: 600; margin-bottom: 3px; }
+  .rw-popup .rw-meta { color: #555; }
+  .rw-popup .rw-sev { font-weight: 600; }
+  .leaflet-popup-content { margin: 10px 12px; }
 </style>
 </head>
 <body>
@@ -80,7 +85,10 @@ info.update = function (props) {
     '<h1>Travel London</h1>' +
     '<p class="sub">Population density — ' + EXPECTED.toLocaleString("en-GB") + ' LSOA areas</p>' + body +
     '<div id="status"></div>' +
-    '<div class="credits">Density: Census 2021 (ONS TS006).<br>Boundaries: ONS Open Geography.<br>' +
+    '<div id="rw-status" style="font-size:11px;color:#555;margin-top:4px;"></div>' +
+    '<div class="credits">' +
+    '<span style="color:#ff8c00;">●</span> planned roadworks · <span style="color:#c0392b;">●</span> live disruptions<br>' +
+    'Density: Census 2021 (ONS TS006).<br>Boundaries: ONS Open Geography.<br>Roadworks: TfL Unified API (live).<br>' +
     '<a href="3d.html">3D view</a> · <a href="boroughs.html">Borough view</a></div>';
 };
 info.addTo(map);
@@ -100,6 +108,77 @@ legend.onAdd = function () {
   return div;
 };
 legend.addTo(map);
+
+// ----------------------------------------------------------------------
+// Live layer: TfL road disruptions (keyless TfL Unified API)
+// One feed; we split it into "Planned roadworks" (category=Works) and
+// "Live disruptions" (incidents, delays, asset issues, events).
+// ----------------------------------------------------------------------
+const TFL_DISRUPTION = "https://api.tfl.gov.uk/Road/all/Disruption";
+const plannedLayer = L.layerGroup();   // category === "Works"
+const liveLayer    = L.layerGroup();   // everything else
+
+const SEV_COLOUR = { Serious: "#c0392b", Severe: "#c0392b", Moderate: "#e67e22", Minimal: "#f1c40f" };
+function sevColour(s) { return SEV_COLOUR[s] || "#e67e22"; }
+
+// Layers control — overlays can be toggled on/off independently.
+// Population density overlay is registered once it has loaded.
+const layersControl = L.control.layers(null, {
+  "Planned roadworks": plannedLayer,
+  "Live disruptions": liveLayer
+}, { collapsed: false, position: "topleft" }).addTo(map);
+
+function esc(s) { return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+function fmtDate(s) {
+  if (!s) return "";
+  const d = new Date(s);
+  return isNaN(d) ? "" : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+}
+
+function disruptionPopup(x) {
+  const isWorks = x.category === "Works";
+  const dates = (x.startDateTime || x.endDateTime)
+    ? '<div class="rw-meta">' + fmtDate(x.startDateTime) + (x.endDateTime ? " → " + fmtDate(x.endDateTime) : "") + "</div>"
+    : "";
+  return '<div class="rw-popup">' +
+    '<div class="rw-loc">' + esc(x.location || x.subCategory || x.category) + "</div>" +
+    '<div class="rw-meta"><span class="rw-sev" style="color:' + sevColour(x.severity) + '">' +
+      esc(x.severity || "") + "</span> · " + esc(isWorks ? (x.subCategory || "Works") : x.category) + "</div>" +
+    (x.comments ? "<div>" + esc(x.comments) + "</div>" : "") +
+    (x.currentUpdate ? '<div class="rw-meta"><em>' + esc(x.currentUpdate) + "</em></div>" : "") +
+    dates +
+    "</div>";
+}
+
+function loadDisruptions() {
+  fetch(TFL_DISRUPTION)
+    .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(items => {
+      let planned = 0, live = 0;
+      items.forEach(x => {
+        const g = x.geography;
+        if (!g || g.type !== "Point" || !g.coordinates) return;
+        const lng = g.coordinates[0], lat = g.coordinates[1];
+        const isWorks = x.category === "Works";
+        const marker = L.circleMarker([lat, lng], {
+          radius: x.severity === "Serious" || x.severity === "Severe" ? 8 : (x.severity === "Moderate" ? 6 : 5),
+          fillColor: isWorks ? "#ff8c00" : "#c0392b",
+          color: "#fff", weight: 1, fillOpacity: 0.9
+        }).bindPopup(disruptionPopup(x));
+        if (isWorks) { marker.addTo(plannedLayer); planned++; }
+        else { marker.addTo(liveLayer); live++; }
+      });
+      plannedLayer.addTo(map);
+      liveLayer.addTo(map);
+      const el = document.getElementById("rw-status");
+      if (el) el.textContent = planned + " planned roadworks · " + live + " live disruptions";
+    })
+    .catch(err => {
+      const el = document.getElementById("rw-status");
+      if (el) { el.textContent = "Roadworks feed unavailable: " + err.message; el.className = "err"; }
+    });
+}
+loadDisruptions();
 
 function setStatus(msg, cls) {
   const el = document.getElementById("status");
@@ -163,6 +242,9 @@ loadAll()
         });
       }
     }).addTo(map);
+
+    // Make the density layer toggleable alongside the roadworks layers
+    layersControl.addOverlay(geoLayer, "Population density");
 
     // Borough outlines on top for orientation
     fetch(BOROUGH_OUTLINES).then(r => r.json()).then(geo => {
