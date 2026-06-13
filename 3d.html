@@ -31,6 +31,10 @@
   }
   .mode button.active { background: #225ea8; color: #fff; border-color: #225ea8; }
   .mode-note { font-size: 10px; color: #999; margin-bottom: 4px; }
+  .layers { border-top: 1px solid #eee; margin-top: 8px; padding-top: 6px; }
+  .layers .lh { font-size: 11px; font-weight: 600; color: #444; margin-bottom: 3px; }
+  .layers label { display: block; font-size: 12px; color: #333; cursor: pointer; line-height: 1.6; }
+  .layers .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 3px 0 1px; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -44,6 +48,11 @@
     <button id="btn-scaled">Scaled buildings</button>
   </div>
   <div class="mode-note" id="mode-note">Each area extruded by its density.</div>
+  <div class="layers">
+    <div class="lh">Live layers</div>
+    <label><input type="checkbox" id="tg-planned" checked> <span class="dot" style="background:#ff8c00"></span><span id="lbl-planned">Planned roadworks</span></label>
+    <label><input type="checkbox" id="tg-live" checked> <span class="dot" style="background:#c0392b"></span><span id="lbl-live">Live disruptions</span></label>
+  </div>
   <div id="hover"><div class="hint">Hover over a block</div></div>
   <div id="status"></div>
   <div class="controls-hint">Drag to pan · Right-click drag (or two fingers) to rotate &amp; tilt · Scroll to zoom</div>
@@ -296,6 +305,104 @@ map.on("load", () => {
           "fill-extrusion-opacity": 0.9
         }
       });
+
+      // ---------- Live layer: TfL roadworks & disruptions ----------
+      // Same keyless feed as the 2D map. Split into planned roadworks
+      // (category "Works") and live disruptions (everything else).
+      map.addSource("disruptions", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+      map.addLayer({
+        id: "planned-roadworks",
+        type: "circle",
+        source: "disruptions",
+        filter: ["==", ["get", "isWorks"], true],
+        paint: {
+          "circle-color": "#ff8c00",
+          "circle-stroke-color": "#fff",
+          "circle-stroke-width": 1,
+          "circle-opacity": 0.9,
+          "circle-radius": ["match", ["get", "severity"], "Serious", 8, "Severe", 8, "Moderate", 6, 5]
+        }
+      });
+      map.addLayer({
+        id: "live-disruptions",
+        type: "circle",
+        source: "disruptions",
+        filter: ["==", ["get", "isWorks"], false],
+        paint: {
+          "circle-color": "#c0392b",
+          "circle-stroke-color": "#fff",
+          "circle-stroke-width": 1,
+          "circle-opacity": 0.95,
+          "circle-radius": ["match", ["get", "severity"], "Serious", 9, "Severe", 9, "Moderate", 7, 6]
+        }
+      });
+
+      function esc(s) { return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+      function fmtDate(s) {
+        if (!s) return "";
+        const d = new Date(s);
+        return isNaN(d) ? "" : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+      }
+      function disruptionPopup(p) {
+        const dates = (p.startDateTime || p.endDateTime)
+          ? '<div style="color:#555">' + fmtDate(p.startDateTime) + (p.endDateTime ? " → " + fmtDate(p.endDateTime) : "") + "</div>" : "";
+        return '<div style="font-size:12px;line-height:1.45;max-width:240px">' +
+          '<div style="font-weight:600;margin-bottom:3px">' + esc(p.location || p.label) + "</div>" +
+          '<div style="color:#555">' + esc(p.severity || "") + " · " + esc(p.label) + "</div>" +
+          (p.comments ? "<div>" + esc(p.comments) + "</div>" : "") +
+          (p.currentUpdate ? '<div style="color:#555"><em>' + esc(p.currentUpdate) + "</em></div>" : "") +
+          dates + "</div>";
+      }
+      ["planned-roadworks", "live-disruptions"].forEach(id => {
+        map.on("click", id, e => {
+          new maplibregl.Popup({ maxWidth: "260px" })
+            .setLngLat(e.lngLat).setHTML(disruptionPopup(e.features[0].properties)).addTo(map);
+        });
+        map.on("mouseenter", id, () => { map.getCanvas().style.cursor = "pointer"; });
+        map.on("mouseleave", id, () => { map.getCanvas().style.cursor = ""; });
+      });
+
+      // Toggle checkboxes (independent on/off, on top of any 3D mode)
+      document.getElementById("tg-planned").onchange = e =>
+        map.setLayoutProperty("planned-roadworks", "visibility", e.target.checked ? "visible" : "none");
+      document.getElementById("tg-live").onchange = e =>
+        map.setLayoutProperty("live-disruptions", "visibility", e.target.checked ? "visible" : "none");
+
+      // Fetch the live feed and populate
+      fetch("https://api.tfl.gov.uk/Road/all/Disruption")
+        .then(r => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(items => {
+          let planned = 0, live = 0;
+          const feats = [];
+          items.forEach(x => {
+            const g = x.geography;
+            if (!g || g.type !== "Point" || !g.coordinates) return;
+            const isWorks = x.category === "Works";
+            if (isWorks) planned++; else live++;
+            feats.push({
+              type: "Feature",
+              geometry: { type: "Point", coordinates: g.coordinates },
+              properties: {
+                isWorks: isWorks,
+                severity: x.severity || "",
+                label: isWorks ? (x.subCategory || "Works") : x.category,
+                location: x.location || "",
+                comments: x.comments || "",
+                currentUpdate: x.currentUpdate || "",
+                startDateTime: x.startDateTime || "",
+                endDateTime: x.endDateTime || ""
+              }
+            });
+          });
+          map.getSource("disruptions").setData({ type: "FeatureCollection", features: feats });
+          const pl = document.getElementById("lbl-planned"), lv = document.getElementById("lbl-live");
+          if (pl) pl.textContent = "Planned roadworks (" + planned + ")";
+          if (lv) lv.textContent = "Live disruptions (" + live + ")";
+        })
+        .catch(() => {
+          const pl = document.getElementById("lbl-planned");
+          if (pl) pl.textContent = "Roadworks feed unavailable";
+        });
 
       // Hover handlers
       const hover = document.getElementById("hover");

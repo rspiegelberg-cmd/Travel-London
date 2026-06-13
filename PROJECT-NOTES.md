@@ -33,11 +33,16 @@ Added the first **live** layer, on `index.html`, with a layer-toggle control (to
   current update, and start→end dates. Panel shows a live count.
 - All additions are self-contained in `index.html`; the density rendering is untouched.
 
+Also added the same live layers to **`3d.html`** (13 June 2026): TfL planned roadworks +
+live disruptions as MapLibre circle layers, with two independent toggle checkboxes ("Live
+layers" section in the panel) and click popups. Sits on top of any 3D mode (density blocks /
+buildings / scaled). Existing 3D modes untouched.
+
 ## Next up (recommended order)
-1. **Apply the same toggle to `3d.html`** (optional) so the 3D view gets roadworks too.
-2. **Start storing daily snapshots** of the TfL feed to the repo — the raw history that future
+1. **Start storing daily snapshots** of the TfL feed to the repo — the raw history that future
    prediction work depends on (e.g. a small JSON saved per day).
-3. **Add a pollution layer** (e.g. London Air / Breathe London) as the next live feed.
+2. **Add a pollution layer** (e.g. London Air / Breathe London) as the next live feed.
+3. **(Optional) put roadworks on `boroughs.html`** too, for full consistency.
 
 ## Parked (deliberately)
 - Company data (Companies House — needs API key, address geocoding). Better as a later layer.
